@@ -10,7 +10,7 @@ from bokeh.plotting import figure, Figure
 from bokeh.models.glyphs import Image, MultiLine
 from bokeh.models import ColumnDataSource
 from bokeh.models import HoverTool, TapTool, BoxAnnotation, Patches, PolyDrawTool, PolyEditTool
-from bokeh.models import Slider, MultiSelect, TextInput, Select, RadioButtonGroup  # UI widgets for data selction
+from bokeh.models import Slider, MultiSelect, TextInput, Select, RadioButtonGroup, DataTable, TableColumn  # UI widgets for data selction
 from bokeh.events import DoubleTap, Tap
 from bokeh.layouts import gridplot, column, row
 from bokeh.io import show, output_notebook
@@ -42,6 +42,7 @@ class LifWidget(WebPlot):
         self.sig_series_changed = BokehCallbackSignal()
         self.sig_channel_changed = BokehCallbackSignal()
         self.sig_roi_tapped = BokehCallbackSignal()
+        self.sig_rois_changed = BokehCallbackSignal()
 
         self.lif_file_path = lif_file_path
         self.lif_reader = explore_lif.Reader(self.lif_file_path)
@@ -82,8 +83,11 @@ class LifWidget(WebPlot):
         self.image_figure.add_tools(self.roi_draw_tool, self.roi_edit_tool)
         self.image_figure.toolbar.active_drag = self.roi_edit_tool
 
-        self.roi_renderer.data_source.selected.on_change('indices', self.sig_roi_tapped)
+        self.roi_renderer.data_source.selected.on_change('indices', self.sig_roi_tapped.trigger)
         self.sig_roi_tapped.connect(self.roi_tapped)
+
+        self.roi_renderer.data_source.on_change('data', self.sig_rois_changed.trigger)
+        self.sig_rois_changed.connect(self.set_roi_table)
 
 
         # must initialize with some array else it won't work
@@ -133,6 +137,9 @@ class LifWidget(WebPlot):
         self.radiobutton_channel.on_change("active", self.sig_channel_changed.trigger)
         self.sig_channel_changed.connect(lambda x: self.set_channel(int(x)))
 
+        self.roi_table_columns = ColumnDataSource({'ix': [], 'tags': []})
+        self.roi_tags_table = DataTable(source=self.roi_table_columns)
+
     @WebPlot.signal_blocker
     def set_series(self, s: str):
         if len(s) != 1:
@@ -166,6 +173,16 @@ class LifWidget(WebPlot):
 
     def roi_tapped(self, ix):
         print(ix)
+        ix = ix[0]
+
+        ds = self.roi_renderer.data_source.data
+        coors = [np.column_stack([ds['xs'][i], ds['ys'][i]]) for i in range(len(ds['xs']))]
+        print(coors[ix])
+
+    def set_roi_table(self, *args):
+        print(args)
+        self.roi_tags_table.source.data['ix'] = list(range(10))
+        self.roi_tags_table.source.data['tags'] = list(range(10))
 
     def set_dashboard(self, doc):
         doc.add_root(
@@ -173,5 +190,6 @@ class LifWidget(WebPlot):
                 self.selector_series,
                 self.radiobutton_channel,
                 self.image_figure,
+                self.roi_tags_table
             )
         )
