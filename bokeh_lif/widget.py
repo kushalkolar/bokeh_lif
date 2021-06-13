@@ -2,14 +2,16 @@ import numpy as np
 from typing import *
 from pathlib import Path
 import explore_lif
+import pandas as pd
 from explore_lif.explore_lif import Serie
 
 
 from bokeh.plotting import figure, Figure
 from bokeh.models.glyphs import Image, MultiLine
 from bokeh.models import ColumnDataSource
-from bokeh.models import HoverTool, TapTool, BoxAnnotation, Patches
+from bokeh.models import HoverTool, TapTool, BoxAnnotation, Patches, PolyDrawTool, PolyEditTool
 from bokeh.models import Slider, MultiSelect, TextInput, Select, RadioButtonGroup  # UI widgets for data selction
+from bokeh.events import DoubleTap, Tap
 from bokeh.layouts import gridplot, column, row
 from bokeh.io import show, output_notebook
 
@@ -18,17 +20,12 @@ from .utils import get_channel_mapping
 
 
 _default_image_figure_params = dict(
-    plot_height=500,
-    plot_width=500,
+    plot_height=1000,
+    plot_width=1000,
     tooltips=[("x", "$x"), ("y", "$y"), ("value", "@image")],
     output_backend='webgl',
-    match_aspect=True,
-)
-
-_default_curve_figure_params = dict(
-    plot_height=250,
-    plot_width=1000,
     tools='tap,hover,pan,wheel_zoom,box_zoom,reset',
+    match_aspect=True,
 )
 
 
@@ -43,8 +40,8 @@ class LifWidget(WebPlot):
         WebPlot.__init__(self)
 
         self.sig_series_changed = BokehCallbackSignal()
-        self.sig_channel_left_changed = BokehCallbackSignal()
-        self.sig_channel_right_changed = BokehCallbackSignal()
+        self.sig_channel_changed = BokehCallbackSignal()
+        self.sig_roi_tapped = BokehCallbackSignal()
 
         self.lif_file_path = lif_file_path
         self.lif_reader = explore_lif.Reader(self.lif_file_path)
@@ -52,33 +49,54 @@ class LifWidget(WebPlot):
         self.image_figure_params = image_figure_params
         self.tooltip_columns = tooltip_columns
 
+        dataframe_columns =\
+        [
+            'filename',
+            'series_name',
+            'xs',
+            'ys',
+            'cell_name'
+        ]
+        self.dataframe = pd.DataFrame(columns=dataframe_columns)
+
         if self.image_figure_params is None:
             self.image_figure_params = dict()
 
-        self.image_figures: List[Figure] = [
-            figure(
-                **{
-                    **_default_image_figure_params,
-                    **self.image_figure_params
-                }
-            ) for i in range(2)
-        ]
+        self.image_figure: Figure = figure(
+            **{
+                **_default_image_figure_params,
+                **self.image_figure_params
+            }
+        )
+
+        self.roi_data_source = ColumnDataSource({'xs': [], 'ys': []})
+
+        self.roi_renderer = self.image_figure.patches('xs', 'ys', source=self.roi_data_source, line_width=3, alpha=0.4)
+        self.vertex_renderer = self.image_figure.circle(
+            [], [], size=5, color='white'
+        )
+
+        self.roi_draw_tool = PolyDrawTool(renderers=[self.roi_renderer])
+        self.roi_edit_tool = PolyEditTool(renderers=[self.roi_renderer], vertex_renderer=self.vertex_renderer)
+
+        self.image_figure.add_tools(self.roi_draw_tool, self.roi_edit_tool)
+        self.image_figure.toolbar.active_drag = self.roi_edit_tool
+
+        self.roi_renderer.data_source.selected.on_change('indices', self.sig_roi_tapped)
+        self.sig_roi_tapped.connect(self.roi_tapped)
+
 
         # must initialize with some array else it won't work
         empty_img = np.zeros(shape=(100, 100), dtype=np.uint8)
 
-        self.image_glyphs: List[Image] = \
-            [
-                fig.image(
-                    image=[empty_img],
-                    x=0, y=0,
-                    dw=10, dh=10,
-                    level="image",
-                ) for fig in self.image_figures
-            ]
+        self.image_glyph: Image = self.image_figure.image(
+            image=[empty_img],
+            x=0, y=0,
+            dw=10, dh=10,
+            level="image",
+        )
 
-        for fig in self.image_figures:
-            fig.grid.grid_line_width = 0
+        self.image_figure.grid.grid_line_width = 0
 
         self.tooltips = None
 
@@ -100,8 +118,7 @@ class LifWidget(WebPlot):
         self.sig_series_changed.connect(self.set_series)
 
         self.series_current: Serie = None
-        self.channel_left_ix: int = None
-        self.channel_right_ix: int = None
+        self.channel_ix: int = None
 
         # channel ui
         # assume laser options are the same for the entire lif file
@@ -110,17 +127,11 @@ class LifWidget(WebPlot):
             series=self.series_list[0]
         )
 
-        self.radiobutton_channel_left = RadioButtonGroup(
+        self.radiobutton_channel = RadioButtonGroup(
             labels=list(map(str, self.channel_mapping.values()))
         )
-        self.radiobutton_channel_left.on_change("active", self.sig_channel_left_changed.trigger)
-        self.sig_channel_left_changed.connect(lambda x: self.set_channel_left(int(x)))
-
-        self.radiobutton_channel_right = RadioButtonGroup(
-            labels=list(map(str, self.channel_mapping.values()))
-        )
-        self.radiobutton_channel_right.on_change("active", self.sig_channel_right_changed.trigger)
-        self.sig_channel_right_changed.connect(lambda x: self.set_channel_right(int(x)))
+        self.radiobutton_channel.on_change("active", self.sig_channel_changed.trigger)
+        self.sig_channel_changed.connect(lambda x: self.set_channel(int(x)))
 
     @WebPlot.signal_blocker
     def set_series(self, s: str):
@@ -137,40 +148,30 @@ class LifWidget(WebPlot):
 
         self.series_current = self.lif_reader.getSeries()[series_ix]
 
-        self.set_channel_left(self.channel_left_ix)
-        self.set_channel_right(self.channel_right_ix)
+        self.set_channel(self.channel_ix)
 
     @WebPlot.signal_blocker
-    def set_channel_left(self, channel_ix):
-        if self.series_current is None:
+    def set_channel(self, channel_ix):
+        if self.series_current is None or channel_ix is None:
             return
 
-        if self.channel_left_ix == channel_ix or channel_ix is None:
-            return
+        self.channel_ix = channel_ix
 
-        self.channel_left_ix = channel_ix
+        self.stack = self.series_current.getFrame(channel=channel_ix)
+        max_proj = self.stack.max(axis=0)
 
-        self.stack_left = self.series_current.getFrame(channel=channel_ix)
-        self.image_glyphs[0].data_source.data['image'] = [self.stack_left.max(axis=0)]
+        self.image_glyph.glyph.dh = max_proj.shape[0]
+        self.image_glyph.glyph.dw = max_proj.shape[1]
+        self.image_glyph.data_source.data['image'] = [max_proj]
 
-    @WebPlot.signal_blocker
-    def set_channel_right(self, channel_ix):
-        if self.series_current is None:
-            return
-
-        if self.channel_right_ix == channel_ix or channel_ix is None:
-            return
-
-        self.channel_right_ix = channel_ix
-
-        self.stack_right = self.series_current.getFrame(channel=channel_ix)
-        self.image_glyphs[1].data_source.data['image'] = [self.stack_right.max(axis=0)]
+    def roi_tapped(self, ix):
+        print(ix)
 
     def set_dashboard(self, doc):
         doc.add_root(
             column(
                 self.selector_series,
-                row(self.radiobutton_channel_left, self.radiobutton_channel_right),
-                row(*self.image_figures),
+                self.radiobutton_channel,
+                self.image_figure,
             )
         )
